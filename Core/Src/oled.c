@@ -31,6 +31,41 @@ void OLED_WriteData(uint8_t Data)
 }
 
 /**
+  * @brief  OLED连续写命令(一次事务发多条命令)
+  * @param  cmd 命令数组
+  * @param  len 命令条数
+  * @note   SSD1306 的"控制字"对它后面、同一次事务里的所有字节都生效，
+  *         所以 0x00 之后可以连着塞多条命令，只需一次 Start/Stop。
+  *         原来 OLED_SetCursor 用 3 次 OLED_WriteCommand = 3 次完整事务，
+  *         合并成 1 次即省下 2 次 Start/数据/Stop 的开销。
+  */
+static void OLED_WriteCmdSeq(const uint8_t *cmd, uint8_t len)
+{
+	MyIIC_Start();
+	MyIIC_SendByte(0x78);		// 从机地址
+	MyIIC_SendByte(0x00);		// 00=写命令
+	MyIIC_SendBytes(cmd, len);	// 一次性发完所有命令
+	MyIIC_Stop();
+}
+
+/**
+  * @brief  OLED连续写数据(一次事务发多个字节)
+  * @param  data 数据首地址
+  * @param  len  字节数
+  * @note   芯片收到一个数据字节后列地址自动+1，所以连续写不需要
+  *         每字节重发地址和控制字。原来写一个 8x16 字符要发 16 次
+  *         单字节事务，现在上下半页各 1 次，共 2 次。
+  */
+static void OLED_WriteDataSeq(const uint8_t *data, uint16_t len)
+{
+	MyIIC_Start();
+	MyIIC_SendByte(0x78);		// 从机地址
+	MyIIC_SendByte(0x40);		// 40=写数据
+	MyIIC_SendBytes(data, len);	// 一次性发完所有数据
+	MyIIC_Stop();
+}
+
+/**
   * @brief  OLED设置光标位置
   * @param  Y 以左上角为原点，向下方向的页，范围：0~7
   * @param  X 以左上角为原点，向右方向的列，范围：0~127
@@ -38,9 +73,11 @@ void OLED_WriteData(uint8_t Data)
   */
 void OLED_SetCursor(uint8_t Y, uint8_t X)
 {
-	OLED_WriteCommand(0xB0 | Y);					//设置页Y
-	OLED_WriteCommand(0x10 | ((X & 0xF0) >> 4));	//X高4位
-	OLED_WriteCommand(0x00 | (X & 0x0F));			//X低4位
+	uint8_t cmd[3];
+	cmd[0] = 0xB0 | Y;					//设置页Y
+	cmd[1] = 0x10 | ((X & 0xF0) >> 4);	//X高4位
+	cmd[2] = 0x00 | (X & 0x0F);			//X低4位
+	OLED_WriteCmdSeq(cmd, 3);			//3条命令合成一次事务
 }
 
 /**
@@ -70,17 +107,10 @@ void OLED_Clear(void)
   */
 void OLED_ShowChar(uint8_t Line, uint8_t Column, char Char)
 {
-	uint8_t i;
-	OLED_SetCursor((Line - 1) * 2, (Column - 1) * 8);		//上半页
-	for (i = 0; i < 8; i++)
-	{
-		OLED_WriteData(OLED_F8x16[Char - ' '][i]);
-	}
-	OLED_SetCursor((Line - 1) * 2 + 1, (Column - 1) * 8);	//下半页
-	for (i = 0; i < 8; i++)
-	{
-		OLED_WriteData(OLED_F8x16[Char - ' '][i + 8]);
-	}
+	OLED_SetCursor((Line - 1) * 2, (Column - 1) * 8);			//上半页
+	OLED_WriteDataSeq(&OLED_F8x16[Char - ' '][0], 8);
+	OLED_SetCursor((Line - 1) * 2 + 1, (Column - 1) * 8);		//下半页
+	OLED_WriteDataSeq(&OLED_F8x16[Char - ' '][8], 8);
 }
 
 /**
@@ -253,7 +283,7 @@ void OLED_Init(void)
 {
 	HAL_Delay(20);			//上电等待
 
-	MyIIC_Init();			//软件I2C初始化 PB6‑SCL PB7‑SDA
+	MyIIC_Init();			//软件I2C初始化 PB8‑SCL PB9‑SDA
 
 	OLED_WriteCommand(0xAE);	//关闭显示
 

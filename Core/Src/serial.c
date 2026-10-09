@@ -1,6 +1,5 @@
-#include "serial.h"
-#include "stm32f1xx_hal_uart.h"    // UART_HandleTypeDef / HAL_UART_Init / HAL_UART_Transmit
-#include "string.h"                // strlen：求字符串长度
+#include "serial.h"       // 已带 stm32f1xx_hal.h(含 uart 模块)
+#include "string.h"        // strlen：求字符串长度
 
 /* ========== UART句柄的"定义" ==========
  * HAL_UART_Init / HAL_UART_Transmit 都需要一个 UART_HandleTypeDef 结构体
@@ -16,16 +15,15 @@
 UART_HandleTypeDef huart2;
 
 /**
- * @brief  UART初始化：异步全双工串口，PA2=TX、PA3=RX，波特率9600，8N1
+ * @brief  UART初始化：异步全双工串口，PA2=TX、PA3=RX，波特率115200，8N1
  * @note   硬件过程：CPU把数据写进DR数据寄存器 → USART把数据搬进移位寄存器
  *         → 移位寄存器按波特率一位一位从TX引脚移出去。
  *          注：usart是《《低位先行》》，所以发送0x12时，先发0x02再发0x01。
- *         配置流程：
- *         1. RCC开启GPIOA、USART2时钟(USART2在APB1总线上，36MHz)；
- *         2. PA2配成复用推挽输出(GPIO_MODE_AF_PP，USART2_TX)，
- *            PA3配成输入(GPIO_MODE_INPUT，USART2_RX)；
- *         3. 配置USART工作模式：全双工(TX_RX)、波特率9600、8位数据、1停止位、无校验(8N1)；
- *         4. HAL_UART_Init初始化。
+ *         配置流程(Init/MspInit 分工)：
+ *         1. HAL_UART_MspInit()：RCC开 GPIOA/USART2 时钟，PA2 配复用推挽输出(TX)、
+ *            PA3 配上拉输入(RX)。MCU 层支撑，由 HAL_UART_Init 自动回调；
+ *         2. Serial_Init()：只配置 USART 工作模式(全双工、波特率115200、8N1)；
+ *         3. HAL_UART_Init()：按上面参数初始化外设。
  *
  *         注意：PA2/PA3 是 USART2 的引脚，USART1 的引脚是 PA9/PA10。
  *         引脚、Instance、时钟三者必须对应同一个外设，否则串口完全不工作。
@@ -36,32 +34,18 @@ UART_HandleTypeDef huart2;
  */
 void Serial_Init(void)
 {
-    // ==========开启GPIOA、USART2时钟==========
-    __HAL_RCC_GPIOA_CLK_ENABLE();   // PA2/PA3所在端口
-    __HAL_RCC_USART2_CLK_ENABLE();  // USART2外设，挂在APB1(36MHz)上
-
-    // ==========GPIO配置：PA2=TX 复用推挽输出==========
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Pin = GPIO_PIN_2;          // PA2 = USART2_TX
-    gpio.Mode = GPIO_MODE_AF_PP;    // 复用推挽输出：引脚交给USART外设控制(不是普通GPIO输出)
-    gpio.Pull = GPIO_NOPULL;        // 推挽输出不用上下拉
-    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    // ==========GPIO配置：PA3=RX 上拉输入==========
-    gpio.Pin = GPIO_PIN_3;         // PA3 = USART2_RX
-    gpio.Mode = GPIO_MODE_INPUT;    // 输入模式：接收外部串口信号(F1的RX就是普通输入)
-    gpio.Pull = GPIO_PULLUP;        // 上拉输入：空闲时稳定在高电平，避免浮空噪声误触发起始位
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    // ==========USART工作模式配置==========
+    // ==========只配置 USART 外设自身的参数==========
+    // 引脚(PA2/PA3)和时钟在 HAL_UART_MspInit() 里配，
+    // HAL_UART_Init() 内部会自动回调它。这就是 Init / MspInit 的分工：
+    //   Init    → 外设自己的工作参数(波特率、数据位、停止位…)
+    //   MspInit → MCU 层面的支撑(GPIO 引脚、时钟使能)
     huart2.Instance = USART2;                  // 指定USART实例为USART2
     huart2.Init.Mode = UART_MODE_TX_RX;       // 全双工：既能发也能收
-    huart2.Init.BaudRate = 115200;             // 波特率：每秒传9600个位(CO2传感器多为9600)
+    huart2.Init.BaudRate = 115200;             // 波特率：每秒115200个位(PC端串口脚本默认也是115200)
     huart2.Init.WordLength = UART_WORDLENGTH_8B; // 数据位：8位
     huart2.Init.StopBits = UART_STOPBITS_1;   // 停止位：1位
     huart2.Init.Parity = UART_PARITY_NONE;    // 校验：无(合起来就是常见的 8N1)
-    HAL_UART_Init(&huart2);
+    HAL_UART_Init(&huart2);                   // 内部会回调 HAL_UART_MspInit
 }
 
 /**

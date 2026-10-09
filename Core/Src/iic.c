@@ -11,7 +11,7 @@
  *   单片机实现I2C有两种方式：
  *   1) 硬件I2C：用STM32内部集成的I2C外设(比如驱动MPU6050用的I2C2)。
  *   2) 软件I2C：不碰硬件外设，直接操作GPIO手动拉高/拉低SCL、SDA，
- *   本文件就是软件I2C，占用 PB6=SCL、PB7=SDA，驱动OLED(地址0x78)。
+ *   本文件就是软件I2C，占用 PB8=SCL、PB9=SDA，驱动OLED(地址0x78)。
  *
  * 【I2C总线三要素】
  *   1. 两根线：SCL(时钟)、SDA(数据)。都是开漏输出，必须外部上拉。
@@ -24,22 +24,41 @@
  */
 
 #define IIC_SCL_PORT GPIOB
-#define IIC_SCL_PIN  GPIO_PIN_6
-#define IIC_SDA_PIN  GPIO_PIN_7
+#define IIC_SCL_PIN  GPIO_PIN_8
+#define IIC_SDA_PIN  GPIO_PIN_9
+
+/* CPU 主频(MHz)，用来把微秒换算成 DWT 的周期数 */
+#define CPU_FREQ_MHZ  72
 
 /**
- * @brief  软件延时(约1us)
+ * @brief  初始化 DWT 周期计数器(CYCCNT)
+ * @note   以前用"空循环数次数"来延时，有两个致命问题：
+ *         1) -O0 下每次循环要走 6 条指令(变量全在栈上)，72 次实际是 ~11us 不是 1us；
+ *         2) 换到 -O2 后，编译器发现空循环没有副作用，会把它整个删掉，延时直接变 0。
+ *         DWT 的 CYCCNT 是内核里的一个"CPU 周期计数器"，读它来计时：
+ *         和优化等级无关，1us 永远是 72 个周期。
+ * @retval None
+ */
+static void DWT_Init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  // 打开跟踪与调试单元(否则 DWT 不计数)
+  DWT->CYCCNT = 0;                                  // 计数清零
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              // 启动 CYCCNT
+}
+
+/**
+ * @brief  精确微秒延时(基于 DWT 周期计数器)
  * @param  us：延时微秒数
- * @note   内层循环 j<72：在72MHz主频下，一次空循环约1个时钟周期，
- *         72次 ≈ 1us。这是"烧CPU换延时"，精度不高，但对软件I2C够用。
- *         严格来说延时该用定时器或SysTick，这里图省事用死循环。
+ * @note   CYCCNT 是 32 位、每个 CPU 周期加 1。这里用无符号减法比较，
+ *         即使计数器溢出回绕也能算出正确的差值(这是处理回绕的标准写法)。
+ *         循环里读的是 volatile 的硬件寄存器，编译器不会把它优化掉。
  * @retval None
  */
 static void Delay_us(uint32_t us)
 {
-  uint32_t i, j;
-  for (i = 0; i < us; i++)
-    for (j = 0; j < 72; j++);
+  uint32_t start = DWT->CYCCNT;
+  uint32_t ticks = us * CPU_FREQ_MHZ;          // 72MHz：1us = 72 个周期
+  while ((DWT->CYCCNT - start) < ticks);
 }
 
 /**
@@ -92,7 +111,7 @@ uint8_t MyIIC_R_SDA(void)
 }
 
 /**
- * @brief  软件I2C初始化：把PB6/PB7配成开漏输出，并把总线置为空闲
+ * @brief  软件I2C初始化：把PB8/PB9配成开漏输出，并把总线置为空闲
  * @note   开漏(GPIO_MODE_OUTPUT_OD)是I2C的硬件要求：
  *         开漏只能拉低、不能主动拉高，两条线靠外部上拉电阻拉到高电平，
  *         这样多个器件可以"线与"——谁拉低总线就是低，都不拉就是高。
@@ -103,6 +122,7 @@ void MyIIC_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  DWT_Init();   // Delay_us 依赖它计时，必须先初始化
 
   GPIO_InitStruct.Pin = IIC_SCL_PIN | IIC_SDA_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;   // 开漏输出(I2C标准)
@@ -159,6 +179,23 @@ void MyIIC_SendByte(uint8_t byte)
   }
   MyIIC_W_SCL(1);     // 第9个时钟(应答位)，这里不读应答信号
   MyIIC_W_SCL(0);
+}
+
+/**
+ * @brief  连续发送多个字节(不产生 Start/Stop)
+ * @param  buf：数据首地址
+ * @param  len：字节数
+ * @note   配合 Start/Stop 使用，把"一大串数据"塞进同一次 I2C 事务。
+ *         SSD1306 收到一个字节后列地址会自动+1，所以连续写不用每字节
+ *         重新发地址和控制字 —— 这正是消掉"每字节一次事务"的关键。
+ * @retval None
+ */
+void MyIIC_SendBytes(const uint8_t *buf, uint16_t len)
+{
+  for (uint16_t i = 0; i < len; i++)
+  {
+    MyIIC_SendByte(buf[i]);
+  }
 }
 
 /**

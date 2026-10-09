@@ -1,10 +1,4 @@
-#include "adc_dma.h"
-#include "stm32f103xb.h"
-#include "stm32f1xx_hal_gpio.h"
-#include "stm32f1xx_hal_rcc.h"
-#include "stm32f1xx_hal_rcc_ex.h"   // __HAL_RCC_ADC_CONFIG / RCC_ADCPCLK2_DIVx
-#include "stm32f1xx_hal_adc_ex.h"   // HAL_ADCEx_Calibration_Start
-#include "stm32f1xx_hal_dma.h"      // DMA_HandleTypeDef / __HAL_LINKDMA
+#include "adc_dma.h"   // 已带 stm32f1xx_hal.h(含 adc/adc_ex/dma 模块)
 
 // ADC1句柄：连续扫描+DMA
 ADC_HandleTypeDef hadc_dma;
@@ -30,23 +24,9 @@ volatile uint16_t adc_dma_buf[ADC_DMA_CH_NUM] = {0};
  */
 void ADC_DMA_Init(void)
 {
-    // 开启GPIOA(模拟引脚)、ADC1(ADC)、DMA1(DMA搬运)三个外设时钟
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_ADC1_CLK_ENABLE();
-    __HAL_RCC_DMA1_CLK_ENABLE();
-
-    // ADC时钟分频：APB2=72MHz / 6 = 12MHz，F1的ADC时钟不能超过14MHz
-    __HAL_RCC_ADC_CONFIG(RCC_ADCPCLK2_DIV6);
-
-    // ==========GPIO配置：PA0、PA1模拟输入==========
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1;  // PA0=ADC1_IN0、PA1=ADC1_IN1
-    gpio.Mode = GPIO_MODE_ANALOG;        // 模拟输入：关闭数字输入电路
-    gpio.Pull = GPIO_NOPULL;
-    gpio.Speed = GPIO_SPEED_HIGH;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    // ==========ADC工作模式：扫描 + 连续==========
+    // ==========只配置 ADC 外设自身的参数==========
+    // 引脚(PA0/PA1)、ADC/DMA 时钟、ADCCLK 分频都在 HAL_ADC_MspInit() / HAL_DMA_MspInit() 里，
+    // HAL_ADC_Init() / HAL_DMA_Init() 内部会自动回调它们。
     hadc_dma.Instance = ADC1;
     hadc_dma.Init.ScanConvMode = ADC_SCAN_ENABLE;        // 扫描模式：多通道逐个转
     hadc_dma.Init.ContinuousConvMode = ENABLE;           // 连续模式：转完一轮自动再来
@@ -71,7 +51,12 @@ void ADC_DMA_Init(void)
     sConfig.Rank = ADC_REGULAR_RANK_2;               // 第2个转换
     HAL_ADC_ConfigChannel(&hadc_dma, &sConfig);
 
-    // ==========DMA配置：DMA1_Channel1==========
+    // ==========只配置 DMA 外设自身的参数==========
+    /* 注意：F1 的 HAL_DMA_Init() 不会回调 HAL_DMA_MspInit()(和其他外设不一样，
+     * 这是 F1 HAL 独有的坑)，所以 DMA1 时钟必须在这里手动开，
+     * 否则 DMA 不搬运，adc_dma_buf 永远停在 0。 */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
     hdma_adc1.Instance = DMA1_Channel1;               // F103 ADC1固定映射DMA1通道1
     hdma_adc1.Init.Direction = DMA_PERIPH_TO_MEMORY;  // 方向：外设(ADC) → 内存(buf)
     hdma_adc1.Init.PeriphInc = DMA_PINC_DISABLE;      // 外设地址不变：一直读同一个ADC_DR

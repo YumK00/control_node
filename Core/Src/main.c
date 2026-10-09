@@ -43,10 +43,11 @@
 #include "adc.h"
 #include "adc_dma.h"
 #include "serial.h"
-#include "co2.h"
 #include "i2c.h"
 #include "spi.h"
 #include "spii.h"
+#include "can.h"
+#include "protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -137,7 +138,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+    HAL_Init();
 
   /* USER CODE BEGIN Init */
   /* ============================================================
@@ -167,9 +168,10 @@ int main(void)
    * ============================================================ */
     OLED_Init();
     ADC_DMA_Init();      //PA0=ADC1_IN0、PA1=ADC1_IN1，扫描+连续+DMA循环搬运
-    Serial_Init();//PA2=TX、PA3=RX，波特率9600，8N1
+    Serial_Init();//PA2=TX、PA3=RX，波特率115200，8N1
     LED_Init();          // LED(PB15)初始化，用于观察 FreeRTOS 任务是否在跑
     Key_Init();          // 按键(PB12)初始化：配成下降沿触发的外部中断
+    CAN_Init();         // PA11=CAN_RX、PA12=CAN_TX，波特率250K
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -285,6 +287,8 @@ void Error_Handler(void)
   __disable_irq();
   while (1)
   {
+    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
+    HAL_Delay(200);
   }
   /* USER CODE END Error_Handler_Debug */
 }

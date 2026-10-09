@@ -5,7 +5,7 @@
 // UART句柄：全局变量，保存USART2配置与运行状态
 extern UART_HandleTypeDef huart2;
 
-// 初始化USART2：PA2=TX、PA3=RX，波特率9600，8N1
+// 初始化USART2：PA2=TX、PA3=RX，波特率115200，8N1
 void Serial_Init(void);
 // 阻塞发送一串数据：发完(或超时)才返回
 void Serial_SendData(const uint8_t *pTxData, uint16_t Size, uint32_t Timeout);
