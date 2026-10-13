@@ -36,18 +36,11 @@
 #include <string.h>
 #include <sys/_intsup.h>
 #include "stm32f1xx_hal_uart.h"
-#include "timer_intern_interrupt.h"
-#include "timer_extern_interrupt.h"
-#include "pwm_oc.h"
-#include "pwm_ic.h"
-#include "adc.h"
 #include "adc_dma.h"
 #include "serial.h"
-#include "i2c.h"
-#include "spi.h"
-#include "spii.h"
 #include "can.h"
 #include "protocol.h"
+#include "motor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -86,10 +79,6 @@
  *  中断里修改、主循环里读的变量必须加 volatile。
  * ============================================================ */
   uint32_t g_oled_counter = 0;// 主循环计数器，用于 OLED 显示
-  //extern volatile uint8_t EXTI_Line12;   // 引用 interrupt.c 里的中断标志
-  //extern volatile uint8_t tim2_interrupt_flag;//timer_intern_interrupt中tim2内部中断标志
-  //extern volatile uint8_t tim2_etr_overflow_flag;//timer_extern_interrupt中tim2外部中断标志
-  //extern TIM_HandleTypeDef tim2;//timer_extern_interrupt中tim2外部中断标志  
 
 
 /* USER CODE END PV */
@@ -171,6 +160,7 @@ int main(void)
     Serial_Init();//PA2=TX、PA3=RX，波特率115200，8N1
     LED_Init();          // LED(PB15)初始化，用于观察 FreeRTOS 任务是否在跑
     Key_Init();          // 按键(PB12)初始化：配成下降沿触发的外部中断
+    Motor_Init();          // PA4和PA5控制方向，PA6=TIM3_CH1，1kHz PWM输出，上电占空比0(电机不转)
     CAN_Init();         // PA11=CAN_RX、PA12=CAN_TX，波特率250K
   /* USER CODE END 2 */
 

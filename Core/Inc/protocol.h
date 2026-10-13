@@ -114,7 +114,7 @@
  *
  * 每行格式：ID | DLC | 发送方 → 接收方 | 名称
  *
- *   0x001 |  1 | 广播 → 全体   | ESTOP     紧急停止
+ *   0x000 |  1 | 广播 → 全体   | ESTOP     紧急停止 / 解除 (看 B0)
  *   0x011 |  3 | A    → 网关   | ALARM_A   A 节点报警
  *   0x012 |  3 | B    → 网关   | ALARM_B   B 节点报警
  *   0x101 |  5 | A    → 全体   | A_SENSOR  A 的传感器数据(周期)
@@ -136,8 +136,19 @@
 
 /* ==================== 具体帧 ID ==================== */
 
-/* --- 紧急安全 --- */
-#define CAN_ID_ESTOP        (CAN_ID(GRP_ESTOP, NODE_BROADCAST))   /* 0x001 广播 */
+/* --- 紧急安全 ---
+ * 急停和解除【共用这一个广播 ID】，靠载荷 B0 区分。
+ *
+ * ★ 为什么不给它们各分一个 ID ★
+ *   GRP_ESTOP = 0x000，而 CAN_ID() 是 group|node。
+ *   想区分就得动低 4 位，可低 4 位的 1/2/3 已经是 NODE_A/B/GW 了 ——
+ *   0x000|1 = 0x001 会和 A 节点撞成同一个 ID（这正是之前版本
+ *   把急停和解除都写成 NODE_BROADCAST 的原因，见下面 ESTOP 那节）。
+ *   所以状态只能放载荷里，ID 保持"全 0 广播"。
+ *
+ *   顺带一个好处：0x000 是最小的标准帧 ID，仲裁时优先级最高，
+ *   总线上有别的流量时急停也能抢到总线，这本来也正是急停要的。 */
+#define CAN_ID_ESTOP        (CAN_ID(GRP_ESTOP, NODE_BROADCAST))   /* 0x000 广播 */
 
 /* --- 事件报警（阶段 2） ---
  * 报警是"事件触发"，不是周期发送：出事才发一帧，所以 ID 里区分
@@ -183,7 +194,7 @@
  * 注意 DLC 也是协议的一部分：发送方按这个长度打包，
  * 接收方按这个长度校验，两边对不上就当没收到。
  */
-#define LEN_ESTOP           1u      /* 0x001 */
+#define LEN_ESTOP           1u      /* 0x000 */
 #define LEN_ALARM           3u      /* 0x011 / 0x012 */
 #define LEN_A_SENSOR        5u      /* 0x101 */
 #define LEN_B_STATUS        4u      /* 0x102 */
@@ -232,6 +243,10 @@
 #define ST_COMM_OK          (1u << 0)   /* bit0：和网关通信正常 */
 #define ST_THRESH           (1u << 1)   /* bit1：已触发阈值 */
 #define ST_ALARM            (1u << 2)   /* bit2：有报警未处理 */
+
+/* ESTOP 的 B0（急停动作） */
+#define ESTOP_ACTION_STOP   1u      /* 急停：立刻停机 */
+#define ESTOP_ACTION_CLEAR  2u      /* 解除急停：恢复运行 */
 
 /* ALARM 的 B0（报警码） */
 #define ALM_SENSOR_FAULT    1u      /* 传感器坏了/读数离谱 */
@@ -480,6 +495,35 @@ static inline void PROTO_PackCtrlMode(uint8_t *d, uint8_t mode, uint8_t cid)
 {
     d[0] = mode;
     d[1] = cid;
+}
+
+/* ==================== 0x000 ESTOP ====================
+ * 方向：任意 → 广播(全体)
+ * DLC ：1
+ *
+ * 字节布局：
+ *   B0  动作 取 ESTOP_ACTION_xxx (1=急停, 2=解除)
+ *
+ * 一个 ID 承担两个动作，靠 B0 区分；是广播，所以载荷里不用放节点号。
+ *
+ * 【接收方的硬性义务 —— 安全帧和普通帧的规矩不一样】
+ *   B0 读到不认识的值时，必须按"急停"执行，不能按"没收到"处理。
+ *   理由：这个字节是唯一区分"停"和"放行"的地方，一旦解析失败就
+ *   当成放行，等于给了一个静默失效的急停 —— 比编不过严重得多。
+ *   所以下面的两个函数之外，接收方也别自己写 if (b0 == 1) else {放行}。
+ *
+ * 【发送方的硬性义务】
+ *   同理，拿不准填什么就填 ESTOP_ACTION_STOP。停一下是安全的，
+ *   误放行不是。
+ */
+static inline void PROTO_PackEstop(uint8_t *d, uint8_t action)
+{
+    d[0] = action;
+}
+
+static inline uint8_t PROTO_EstopAction(const uint8_t *d)
+{
+    return d[0];
 }
 
 /* ==================== 0x011/0x012 ALARM ====================

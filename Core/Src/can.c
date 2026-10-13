@@ -32,9 +32,19 @@ void CAN_Init(void)
     hcan1.Init.SyncJumpWidth = CAN_SJW_2TQ;   // 同步跳变宽度 = 2 tq
 
     hcan1.Init.TimeTriggeredMode = DISABLE;   // 不用时间触发
-    hcan1.Init.AutoBusOff = DISABLE;          // 不自动总线关闭
-    hcan1.Init.AutoWakeUp = DISABLE;          // 不自动唤醒
-    hcan1.Init.AutoRetransmission = DISABLE;   // 发送失败自动重发
+    /* AutoBusOff(ABOM)：掉到 BUS-OFF 之后能不能自己爬回来。
+     *   ENABLE  = 硬件在总线上数到 128 次"连续 11 位隐性"就自动恢复收发 —— 常规配置
+     *   DISABLE = 硬件置起 INIT 就不管了，【软件不清 INIT 就永远醒不过来】，
+     *             而本项目没有任何地方清 INIT ⇒ 一旦掉线只能手动复位。
+     * 注意它管的是【恢复】，不是"要不要掉线"：TEC>255 时掉线是硬件强制的，拦不住。 */
+    hcan1.Init.AutoBusOff = ENABLE;
+    hcan1.Init.AutoWakeUp = DISABLE;          // 不自动唤醒(只在 Sleep 模式下有意义)
+    /* AutoRetransmission(NART)：发失败要不要硬件自动重发。
+     *   ENABLE  = 一直重发到成功为止(或掉到 BUS-OFF) —— 常规配置，不丢帧
+     *   DISABLE = 只发一次，失败就丢，错误计数 +8，邮箱释放
+     * 排物理层故障时可以临时改成 DISABLE：那时 ENABLE 会疯狂重发、刷一堆错误帧
+     * 把总线搅得更乱、更快掉线。物理层正常时就用 ENABLE。 */
+    hcan1.Init.AutoRetransmission = ENABLE;
     hcan1.Init.ReceiveFifoLocked = DISABLE;   // 接收FIFO满时新帧覆盖旧帧
     hcan1.Init.TransmitFifoPriority = DISABLE;// 发送邮箱按ID优先级决定
     HAL_CAN_Init(&hcan1);                     // 内部回调 HAL_CAN_MspInit
