@@ -18,13 +18,9 @@
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
-#include "FreeRTOS.h"
 #include "cmsis_os2.h"
 #include "stm32f103xb.h"
-#include "task.h"
 #include "main.h"
-#include "cmsis_os.h"
-#include "semphr.h"
 #include "stdio.h"
 #include "string.h"
 
@@ -57,12 +53,22 @@ typedef struct{
 /* 心跳超时门限：对端心跳周期 1s，3 倍时间收不到就判掉线 */
 #define HB_TIMEOUT_MS   3000u
 
-/* 电机命令超时：转着的时候 3 秒没有新命令就停车(网关掉线/CAN 线断了) */
-#define MOTOR_CMD_TIMEOUT_MS   3000u
+/* 电机断线保护：转着的时候，3 秒收不到【网关心跳】就停车
+ * (网关掉电 / CAN 线断了 / 网关卡死)。
+ *
+ * 判据是网关心跳(0x703)而不是"多久没收到电机命令"：电机命令是【状态】
+ * 不是事件，网关活着就一直保持最后那个速度，不需要反复刷新它。
+ * 数"多久没收到命令"的话，网关就得每秒重发同一条命令来喂这个计数器 ——
+ * 白占总线，还会逼着 cid 兼职当保活。 */
+#define MOTOR_GW_LOST_MS   3000u
 
 /* motorTask 的轮询周期。10ms 足够跟上下发的命令(命令本身是百毫秒级的)，
  * 又不会白占 CPU。以后要上闭环 PID，就把它当控制周期用。 */
 #define MOTOR_TASK_PERIOD_MS     10u
+
+/* FWD/REV 命令按协议【不带速度】(B1 忽略)，所以"起步速度"只能是本地定的。
+ * 已经在转就直接沿用原速度，停着才用这个值。 */
+#define MOTOR_START_SPEED        20u
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -105,16 +111,16 @@ const osThreadAttr_t motorTask_attributes = {
 /* ==================== 电机命令邮箱 ====================
  * canRxTask 写、motorTask 读，一写一读，没有第三方碰。
  *
- * 【为什么用共享变量而不是队列】
- * 目标速度是"最新值有效"，不是事件流：网关连发三条 SETSPEED，
- * 只关心最后一条。队列会把三条都排着，电机依次 50→60→70 抖三下。
- *
  * 【写入顺序不能反】先写 target 再写 cnt —— 这样读到新 cnt 的一方
  * 必然也看到了新的 target。反过来写的话，读到新 cnt 却可能还是旧 target。
  */
 static volatile int16_t g_motor_target  = 0;   /* 目标速度 -100~+100 */
 static volatile uint8_t g_motor_cmd_cnt = 0;   /* 命令序号，每来一条 +1(自然回绕) */
 static volatile bool g_estop_istrue = false;   // false: 正常运行，true: 紧急停止
+
+/* 【网关心跳时刻】最近一次收到网关心跳(0x703)的时刻(ms)。
+ * 刷新处：canRxTask 的 0x703 分支。读取处：motorTask 的断线保护。 */
+static volatile uint32_t g_gw_hb_tick = 0;
 
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
@@ -202,14 +208,49 @@ void StartDefaultTask(void *argument)
 
 /* USER CODE BEGIN Application */
 
+/* ==================== 网关判活 ====================
+ * 【全工程唯一判据】motorTask 的断线保护和 B_STATUS 的 bit0 都用这一个。
+ *
+ * g_gw_hb_tick == 0 表示从没见过网关。0 能当哨兵用：
+ * 心跳真到达时 osKernelGetTickCount() 早就 > 0 了。
+ * 保守方向是对的 —— 没确认网关活着，就不许它转。 */
+static bool B_GwOnline(void)
+{
+  if (g_gw_hb_tick == 0u) { return false; }
+  return (osKernelGetTickCount() - g_gw_hb_tick) <= MOTOR_GW_LOST_MS;
+}
+
+/* ==================== B_STATUS 的 B3：flags 位图 ====================
+ * 【每次打包现算，不存变量】。理由：bit0 是【时间驱动】的 —— 网关口掉电
+ * 之后那 3 秒里没有任何代码在跑，存成变量就没人能把它清掉，得再加一段
+ * 超时扫描去维护；而现算的代价只是一次减法和一次比较(每秒一次)。
+ *
+ * 只存原始输入(g_gw_hb_tick / g_estop_istrue)，位图本身不缓存 ——
+ * 和 PWM_GetDuty() 直接读 CCR 反算、不另存一份是同一个道理。 */
+static uint8_t B_GetFlags(void)
+{
+  uint8_t f = 0;
+
+  if (B_GwOnline())   { f |= ST_COMM_OK; }   /* bit0 和网关通信正常 */
+  if (g_estop_istrue) { f |= ST_ESTOP;   }   /* bit3 急停中 */
+
+  /* bit1 ST_THRESH / bit2 ST_ALARM 先空着：还没有生产者。
+   *   ST_THRESH ← AUTO 模式里"越没越线"的判断
+   *   ST_ALARM  ← 报警码 g_alarm(谁发现故障谁置，上报任务只读)
+   * 这两条各自做出来后，在这里各加一行 if 就接上了。
+   * 现在硬填就是造假位：云端看到"已触发阈值"，可工程里没有阈值在比。 */
+
+  return f;
+}
+
 void canHeartTask(void *argument){
   uint8_t hb_cnt = 0;                    // 心跳计数，每发一次 +1(0~255 自动回绕)
   uint8_t hb[LEN_HEARTBEAT];             // 2 字节：魔数 + 计数
 
   for(;;){
     PROTO_PackHeartbeat(hb, HB_MAGIC_B, hb_cnt++);
-    CAN_Send(CAN_ID_B_HEARTBEAT, hb, LEN_HEARTBEAT);   // 0x701，2 字节
-    vTaskDelay(pdMS_TO_TICKS(1000));     // 1 秒一次
+    CAN_Send(CAN_ID_B_HEARTBEAT, hb, LEN_HEARTBEAT);   // 0x702，2 字节
+    osDelay(1000);                       // 1 秒一次
   }
 }
 
@@ -235,11 +276,11 @@ void canTxTask(void *argument){
       .motor = (spd > 0) ? MST_FWD : ((spd < 0) ? MST_REV : MST_IDLE),
       .pwm   = (uint8_t)((spd > 0) ? spd : -spd),   /* 取绝对值，B1 是 0~100 */
       .mode  = MODE_MANUAL,       /* 占位：模式切换(0x332)还没做 */
-      .flags = 0,                 /* 占位：ST_COMM_OK 要等网关心跳判活做完再补 */
+      .flags = B_GetFlags(),      /* 现算：bit0=网关在线，bit3=急停中 */
     };
     PROTO_PackBStatus(data, b.motor, b.pwm, b.mode, b.flags);
     CAN_Send(CAN_ID_B_STATUS, data, LEN_B_STATUS);
-    vTaskDelay(pdMS_TO_TICKS(1000));     // 1 秒一次
+    osDelay(1000);                       // 1 秒一次
   }
 }
 
@@ -264,52 +305,50 @@ void canTxTask(void *argument){
  *         PWM 和方向脚会打乱换向时序(见 motor.c 里那段电流尖峰说明)。
  */
 void motorTask(void *argument){
+  uint8_t  last_cnt  = 0;      /* 上一次见过的命令序号 */
+  int16_t  applied   = 0;      /* 已经下发给电机的速度 */
   for(;;){
+    //非制动状态下执行电机控制
     if(g_estop_istrue == false){
-      Motor_SetSpeed(20);
+      if(g_motor_cmd_cnt != last_cnt)
+      {      /* uint8 自然回绕，用 != 比较天生正确 */
+        last_cnt  = g_motor_cmd_cnt;
+        if(g_motor_target != applied)
+        {
+          Motor_SetSpeed(g_motor_target);
+          applied = g_motor_target;//记录下发给电机的速度供下次判断
+        }
+      }
     }
     else{
       Motor_SetSpeed(0);
+      applied = 0;
+
+      /* 吃掉急停期间积压的命令：解除后不会自动跳到那期间收到的命令，
+       * 必须由云端【重新下发】才动。 */
+      last_cnt = g_motor_cmd_cnt;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
+    /* ---- 2. 断线保护：正在转，但【网关】已经 3 秒没心跳了 ----
+     * 判据是网关心跳(0x703)，不是"多久没收到电机命令"：
+     * 命令是状态不是事件，网关活着就一直保持最后的速度，不需要反复刷新。
+     * 心跳一断(网关掉电 / CAN 线断 / 网关卡死) → 停车。
+     * 上电时 g_gw_hb_tick=0，若此时 applied!=0 会立刻停 —— 正是要的效果。 */
+    if (applied != 0 && !B_GwOnline()){
+      Motor_SetSpeed(0);
+      applied = 0;
+    }
+    osDelay(MOTOR_TASK_PERIOD_MS);
   }
-  // uint8_t  last_cnt  = 0;      /* 上一次见过的命令序号 */
-  // uint32_t last_tick = 0;      /* 上一次收到命令的时刻 */
-  // int16_t  applied   = 0;      /* 已经下发给电机的速度 */
-
-  // for(;;){
-  //   /* ---- 1. 有新命令就执行 ---- */
-  //   if (g_motor_cmd_cnt != last_cnt){      /* uint8 自然回绕，用 != 比较天生正确 */
-  //     last_cnt  = g_motor_cmd_cnt;
-  //     /* 每条命令都要刷新计时，不能只在"值变了"的时候刷：
-  //      * 网关每 100ms 重发同一个速度时 target == applied，
-  //      * 只比值的话计时永远不更新，超时保护会误判成"没命令"而停车。 */
-  //     last_tick = osKernelGetTickCount();
-
-  //     if (g_motor_target != applied){
-  //       Motor_SetSpeed(g_motor_target);
-  //       applied = g_motor_target;
-  //     }
-  //   }
-
-  //   /* ---- 2. 断线保护：正在转，但超过 3 秒没有新命令 ---- */
-  //   if (applied != 0 && (osKernelGetTickCount() - last_tick) > MOTOR_CMD_TIMEOUT_MS){
-  //     Motor_SetSpeed(0);
-  //     applied = 0;
-  //   }
-
-  //   osDelay(MOTOR_TASK_PERIOD_MS);
-  // }
 }
 
 /**
  * @brief  CAN 接收显示任务：传感器数据显示 + A 心跳判活
  * @note   ---------------------
- *         |id len lost        |
- *         |ir ldr seq         |
-           |1/0 1/0 12345      |
-           |a ON/OFF  gw ON/OFF|
-           ---------------------
+ *         |id len lost          |
+ *         |ir ldr seq           |
+           |1/0 1/0 12345 (ESTOP)|
+           |a ON/OFF  gw ON/OFF  |
+           --------------------- 
  */
 void canRxTask(void *argument){
   CanFrame frame;
@@ -323,8 +362,9 @@ void canRxTask(void *argument){
   uint32_t last_gw_tick = 0;    // 上次收到 gw 心跳的时刻
   uint8_t  gw_online    = 0;    // 网关是否在线
   for(;;){
-    /* 最多等 500ms：有帧就处理，没帧也要醒来查超时 */
-    if (osMessageQueueGet(canRxQueue, &frame, NULL, pdMS_TO_TICKS(500)) == osOK)
+    /* 最多等 500 tick。configTICK_RATE_HZ=1000 ⇒ 1 tick = 1ms，所以这就是 500ms。
+     * 有帧就处理，没帧也要醒来查超时。 */
+    if (osMessageQueueGet(canRxQueue, &frame, NULL, 500) == osOK)
     {
       OLED_ShowHexNum(1, 1, frame.id, 3);    // 第1行：11位ID → 最多 3 位十六进制(0x7FF)
       OLED_ShowNum(1, 5, frame.len, 1);      //       DLC 0~8，1 位就够
@@ -379,6 +419,9 @@ void canRxTask(void *argument){
                && frame.data[0] == HB_MAGIC_GW)
       {
         last_gw_tick = osKernelGetTickCount();
+        /* 同一时刻再存进全局那份，给 motorTask 的断线保护用。
+         * 两处刷同一个值，故意的：locals 管 OLED 显示，global 管电机。 */
+        g_gw_hb_tick = last_gw_tick;
         if (!gw_online)
         {
           gw_online = 1;
@@ -387,6 +430,10 @@ void canRxTask(void *argument){
       }
 
       /* ---- 0x302 网关下发的电机命令 ----
+      B0  命令      取 MOTOR_xxx
+      B1  参数      命令为 MOTOR_SETSPEED 时表示速度 0~100，其余命令忽略此字节
+      B2  命令序号 cid
+
        * 这里【只解包 + 写命令邮箱】，不碰电机。
        * 真正调 Motor_SetSpeed() 的是 motorTask，保证只有一个执行者。 */
       else if (frame.id == CAN_ID_CTRL_MOTOR_B && frame.len == LEN_CTRL_MOTOR)
@@ -401,20 +448,36 @@ void canRxTask(void *argument){
         {
           last_cid = cmd.cid;
 
-          /* cur 带符号(方向)，mag 只取大小。两个都要留着：
-           * 换向命令要用 mag 保持速度，SETSPEED 要用 cur 的符号保持方向。 */
+          /* cur 带符号(方向就在符号里)，mag 只取大小。
+           * 方向命令要用 mag 保持速度，SETSPEED 要用 cur 的符号保持方向。 */
           int16_t cur = Motor_GetSpeed();
-          int16_t mag = (cur < 0) ? -cur : cur;
+          int16_t mag;
+          if (cur < 0) { mag = -cur; }
+          else         { mag =  cur; }
 
           int16_t want;
+
           switch (cmd.cmd)
           {
-          case MOTOR_STOP: want = 0;                            break;
-          case MOTOR_FWD:  want = (mag > 0) ?  mag :  100;      break;
-          case MOTOR_REV:  want = (mag > 0) ? -mag : -100;      break;
-          /* SETSPEED 只给大小，方向沿用当前的；现在停着没方向就默认正转 */
-          default:         want = (cur < 0) ? -(int16_t)cmd.arg
-                                            :  (int16_t)cmd.arg; break;
+          case MOTOR_STOP:
+            want = 0;
+            break;
+
+          case MOTOR_FWD:
+          case MOTOR_REV:
+            /* 方向命令不带速度：已经在转就保持原速度，只换方向；
+             * 停着才用起步速度。 */
+            if (mag == 0) { mag = MOTOR_START_SPEED; }
+            
+            if (cmd.cmd == MOTOR_FWD) { want =  mag; }
+            else                      { want = -mag; }
+            break;
+
+          default:   /* MOTOR_SETSPEED */
+            /* B1 是速度大小 0~100，方向沿用当前的；停着没方向就默认正转 */
+            if (cur < 0) { want = -(int16_t)cmd.arg; }
+            else         { want =  (int16_t)cmd.arg; }
+            break;
           }
 
           g_motor_target = want;     /* 先写值 */
