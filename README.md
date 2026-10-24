@@ -2,7 +2,6 @@
 
 > STM32F103 + FreeRTOS 的 CAN 执行节点，节点号 `NODE_B = 2`，负责把网关下发的电机命令翻译成 H 桥动作，并把自身状态与急停标志回传总线。
 > 在整条链路里它是"手"：采集节点（A）是"眼"，ESP32-S3 网关是"网关与上云口"，B 挂在同一条 250 kbps CAN 总线上，收 `0x302` 干活、发 `0x102` 汇报、收 `0x000` 立刻停。
-> 现状是**开环 PWM + 状态回传**：没有编码器、没有电流采样，因此 `0x312/0x322/0x332` 三帧尚未实现，代码里也不存在闭环 PID。
 
 ## 一、项目简介
 
@@ -188,20 +187,8 @@ MCU 依据：三个源文件都 `#include "stm32f103xb.h"`，`stm32f1xx_hal_conf
 | 软件 I2C | PB8/PB9 开漏 + DWT CYCCNT 微秒延时 | SSD1306 128×64 |
 | FreeRTOS | heap_4 8 KB、1 kHz tick、5 个应用任务 | 调度 |
 
-## 七、构建与烧录
 
-本仓库**只有 `Core/Inc` 与 `Core/Src`**，不含 `Drivers/`（HAL 与 CMSIS 源码）、启动文件、链接脚本、`.ioc` 与任何 Keil/CubeIDE/Makefile 工程。因此仓库本身不能直接编译，必须先在本地补齐工程骨架，二选一：
-
-1. **CubeMX 重建（推荐）**：新建 `STM32F103xB` 工程（HSE = 8 MHz），按第六节勾选外设——CAN1（PA11/PA12，250 kbit/s，RX0 中断）、USART2（异步 115200）、ADC1（CH0/CH1，扫描 + 连续 + DMA 循环）、TIM3_CH1 PWM、GPIO 输出与 PB12 EXTI、FreeRTOS（CMSIS_V2，heap 8 KB）；**HAL 时基必须选 TIM4**（选默认 SysTick 则 `timebase_tim.c` 与 `HAL_TIM_PeriodElapsedCallback` 对不上）；生成后把本仓库 `Core/` 覆盖过去，并保留本仓库的 `FreeRTOSConfig.h`、`protocol.h` 与各 `*.c`。
-2. **同型号空工程覆盖**：拿一份已带 HAL 驱动的 STM32F103xB 空工程（Keil MDK 或 STM32CubeIDE），把 `Core/Inc`、`Core/Src` 整体替换，只保留其工程文件与 `Drivers/`。
-
-注意点：
-
-- 编译宏必须定义 `STM32F103xB`（源文件直接 `#include "stm32f103xb.h"`），否则头文件找不到；`HAL_CAN_MODULE_ENABLED` 必须在 `stm32f1xx_hal_conf.h` 打开（仓库内已打开），HAL 版本需含 `HAL_CAN_AddTxMessage` 等 CAN 模块 API。
-- 若 CubeMX 重新生成，注意不要覆盖 `freertos.c` 的业务代码，重新生成前先备份。
-- 烧录走 SWD（PA13/PA14，`SWJ_NOJTAG` 已保留）；上总线前必须接 CAN 收发器（TJA1050 等）并在总线**两端各加 120 Ω** 终端电阻，否则会持续报错、一帧也收不到（`can.c` 注释明确点出）。
-
-## 八、技术栈与技术亮点
+## 七、技术栈与技术亮点
 
 技术栈：C（C99，HAL 风格）、STM32F1 HAL、FreeRTOS 10.3.1 + CMSIS-RTOS v2 封装、heap_4、CAN 2.0A、SSD1306 软件 I2C、DWT 周期计数器延时、CubeMX 目录约定。亮点（均能在代码里找到对应实现）：
 
@@ -239,26 +226,3 @@ MCU 依据：三个源文件都 `#include "stm32f103xb.h"`，`stm32f1xx_hal_conf
 - 根因：`main.c` 的时钟树在 PLL ×9（72 MHz）之后又做了 **AHB ÷2**，实际 HCLK = 36 MHz。`pwm.c` 按 72 MHz 推算 `PSC=71` 得 1 kHz，实际是 `36 MHz/72/1000 ≈ 500 Hz`；同理 `adc_dma.c` 注释的 ADCCLK 12 MHz 实为 6 MHz，`iic.c` 的 `CPU_FREQ_MHZ 72` 使 `Delay_us(1)` 实际约 2 µs，软件 I2C 速率约为设计值一半。这些注释与实配不符，属于**已知差异**，不是编译器问题。
 - 定位：示波器测 PA6 周期（应约 2 ms）；或读 `RCC->CFGR` 的 HPRE 位确认分频。
 - 处理：按 500 Hz 选驱动板参数即可；若要 1 kHz，把 `PWM_PRESCALER` 改成 35（36 MHz/36/1000 = 1 kHz），同时把 `iic.c` 的 `CPU_FREQ_MHZ` 改成 36 让 I2C 时基正确。
-
-## 十、相关仓库与备注
-
-| 仓库 | 平台 | 与本仓库的关系 |
-| --- | --- | --- |
-| [collecton_node](https://github.com/YumK00/collecton_node) | STM32F103 / FreeRTOS | 同一条 CAN 总线上的采集节点 A（`NODE_A = 1`） |
-| [gateway_node](https://github.com/YumK00/gateway_node) | ESP32-S3 / ESP-IDF | 同一条总线上的网关（`NODE_GW = 3`），本节点的命令来源与状态出口 |
-| [v_car](https://github.com/YumK00/v_car) | Qt / C++ | 独立项目：车载域 T-Box 仿真，自有 `car/ecu/*` 主题与 Broker，不在本总线上 |
-| [weather_bureau](https://github.com/YumK00/weather_bureau) | Linux C++ | 独立项目：气象数据开放平台（Linux C++ 后端） |
-
-- 三个嵌入式仓库共用 `protocol.h`（v3.0）。改协议只增不改；改任何字节布局或 DLC 必须同步帧总表与字节表，并通知另外两端。
-
-### 备注与待完善（均为代码现状，不是猜测）
-
-1. **未实现的控制能力**：无编码器、无电流采样 ⇒ 没有转速闭环；`0x312` 目标值、`0x322` PID 参数、`0x332` 模式切换均未解析；`0x102` 的 `B2` 恒为 `MODE_MANUAL`，`B3` bit1/bit2 恒 0（注释里提到的 `g_alarm` 变量实际不存在）。
-2. **未知电机命令按调速处理**：`0x302` 的 `switch` 用 `default` 兜 `MOTOR_SETSPEED`，任何未定义命令码（如 `9`）都会被当成"设速"执行，与急停那种保守兜底相反，属于可加固点。
-3. **`CAN_Send()` 无互斥保护**：`canTxTask`（AboveNormal）与 `canHeartTask`（Low7）共用 `hcan1` 调 `HAL_CAN_AddTxMessage()`，前者可抢占后者，理论上存在发送邮箱竞争；当前帧率极低（1 Hz ×2）不易暴露。
-4. **无 CAN 错误处理**：只靠 `AutoBusOff = ENABLE` 让硬件自动恢复，未实现 `HAL_CAN_ErrorCallback()`，也没有把错误计数/错误帧上报；`HAL_CAN_Init()` 的返回值是唯一没检查的初始化调用。
-5. **`ALARM_B (0x012)` 未发送**：`canRxTask` 里 A 掉线只刷 OLED（注释写"阶段 2 补发 ALM_COMM_LOST 报警帧"），没有真正发帧。
-6. **冗余/未调用代码**：`adc_dma.c` 的采样值无人读取；`serial.c` 的阻塞收发与 `0xAA55` 帧无人调用；`g_sample_enable`、`freertos.c` 里的 `s_serialData` 结构体均未被使用；`oled.c` 的 `OLED_ClearBuffer/OLED_DrawPixel/OLED_DrawFilledCircle/OLED_Update` 只在 `OLED_Init()` 里调用一次，运行期仍走"逐字段刷屏"的慢路径。
-7. **`PWM_WaitNextPeriod()` 是忙等**：换向时最多自旋一个 PWM 周期（约 2 ms），期间独占 CPU；因 `motorTask` 优先级最高且只在换向时触发，暂可接受。
-8. **仓库不完整**：缺 `Drivers/`、`.ioc`、工程文件与链接脚本，无法开箱编译；上文引脚、频率、栈大小均可与源码逐条对齐，唯有 MCU 具体封装（如 C8T6）需按实物确认。
-9. **`Error_Handler()` 先关中断再调 `HAL_Delay()`**：`main.c` 里是 `__disable_irq(); while(1){ HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8); HAL_Delay(200); }`，关中断后 HAL 的 1 ms 时基（TIM4 中断）不再递增，`HAL_Delay()` 会永久卡住，PA8 的故障指示只翻转一次；应改成纯空循环或计数延时，避免"故障灯不闪"反而掩盖故障。
